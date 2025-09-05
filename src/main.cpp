@@ -2,6 +2,7 @@
 #include <cassert>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,11 +37,11 @@ int main(int argc, char **argv) {
     struct mmsghdr msgs_common_addr[MAX_MSGS];
     ::memset(&msgs_common_addr, 0, sizeof(msgs));
 
-    struct iovec iovecs[MAX_MSGS];
-    ::memset(&iovecs, 0, sizeof(iovecs));
+    struct iovec iovecs_const[MAX_MSGS];
+    ::memset(&iovecs_const, 0, sizeof(iovecs_const));
 
     struct iovec iovecs_mut[MAX_MSGS];
-    ::memset(&iovecs_mut, 0, sizeof(iovecs));
+    ::memset(&iovecs_mut, 0, sizeof(iovecs_mut));
 
     struct sockaddr_in6 req_addrs[MAX_MSGS];
     ::memset(&req_addrs, 0, sizeof(req_addrs));
@@ -51,18 +52,18 @@ int main(int argc, char **argv) {
     static unsigned char buffers[BUFFER_SIZE][MAX_MSGS];
 
     for (int i = 0; i < MAX_MSGS; i++) {
-        iovecs[i].iov_base = buffers[i];
-        iovecs[i].iov_len = BUFFER_SIZE;
+        iovecs_const[i].iov_base = buffers[i];
+        iovecs_const[i].iov_len = BUFFER_SIZE;
 
         iovecs_mut[i].iov_base = buffers[i];
         iovecs_mut[i].iov_len = 0;
 
         msgs[i].msg_hdr.msg_name = &req_addrs[i];
         msgs[i].msg_hdr.msg_namelen = sizeof(req_addrs[i]);
-        msgs[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs[i].msg_hdr.msg_iov = &iovecs_const[i];
         msgs[i].msg_hdr.msg_iovlen = 1;
 
-        msgs_no_addr[i].msg_hdr.msg_iov = &iovecs[i];
+        msgs_no_addr[i].msg_hdr.msg_iov = &iovecs_const[i];
         msgs_no_addr[i].msg_hdr.msg_iovlen = 1;
 
         msgs_common_addr[i].msg_hdr.msg_name = &resp_common_addr;
@@ -93,18 +94,28 @@ int main(int argc, char **argv) {
 
     AddrTable table;
 
-    Epoll ep;
-    ep.add(listen_fd);
-    ep.add(timer_fd);
+    Epoll epoll;
+    epoll.add(listen_fd);
+    epoll.add(timer_fd);
 
     struct epoll_event events[MAX_EVENTS];
+
+    static sig_atomic_t exitFlag = 0;
+    for (int signum : {SIGINT, SIGTERM, SIGHUP}) {
+        if (::signal(signum, [](int) { exitFlag = 1; }) == SIG_ERR) {
+            throw std::system_error(errno, std::generic_category(), "signal");
+        }
+    }
 
     std::cout << Tools::showSockaddr(reinterpret_cast<struct sockaddr *>(&bind_addr)) << " -> "
               << Tools::showSockaddr(cnctr.getAddr()) << std::endl;
 
-    while (true) {
-        int num_events = ep.wait(events, MAX_EVENTS, -1);
+    while (!exitFlag) {
+        int num_events = epoll.wait(events, MAX_EVENTS, -1);
         if (num_events == -1) {
+            if (errno == EINTR) {
+                continue;
+            }
             perror("epoll_wait");
             return_code = EXIT_FAILURE;
             break;
@@ -131,7 +142,7 @@ int main(int argc, char **argv) {
                             mask
                         );
                     }
-                    
+
                     struct sockaddr_in6 &client_addr =
                         *reinterpret_cast<struct sockaddr_in6 *>(msgs[i].msg_hdr.msg_name);
 
@@ -149,25 +160,25 @@ int main(int argc, char **argv) {
                             continue;
                         }
                         table.add(sock, client_addr);
-                        ep.add(sock);
+                        epoll.add(sock);
                     }
                 }
             } else if (sock == timer_fd) {
                 uint64_t expirations;
-                if (read(timer_fd, &expirations, sizeof(expirations)) != sizeof(expirations)) {
-                    perror("read timerfd");
+                if (::read(timer_fd, &expirations, sizeof(expirations)) != sizeof(expirations)) {
+                    perror("read timer fd");
                     continue;
                 }
 
                 table.cleanup([&](int sock, const struct sockaddr_in6 &) {
-                    ep.del(sock);
+                    epoll.del(sock);
                     close(sock);
                 });
             } else {
                 int msg_cnt = ::recvmmsg(sock, msgs_no_addr, MAX_MSGS, MSG_DONTWAIT, NULL);
                 if (msg_cnt < 0) {
                     ::perror("recvmmsg");
-                    ep.del(sock);
+                    epoll.del(sock);
                     table.erase(sock);
                     ::close(sock);
                     continue;
@@ -211,5 +222,8 @@ int main(int argc, char **argv) {
         ::perror("close");
         return_code = EXIT_FAILURE;
     }
+
+    std::cout << "Exit" << std::endl;
+
     return return_code;
 }
